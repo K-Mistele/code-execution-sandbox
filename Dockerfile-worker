@@ -1,0 +1,75 @@
+FROM python:3.12-slim-bookworm
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+WORKDIR /opt
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    socat \
+    jq \
+    qemu-kvm \
+    bridge-utils \
+    iproute2 \
+    iputils-ping \
+    wget \
+    squashfs-tools \
+    openssh-client \
+    file \
+    && rm -rf /var/lib/apt/lists/*
+
+
+# install vm image and ext4 rootfs
+RUN ARCH="$(uname -m)" \
+    && latest=$(wget "http://spec.ccfc.min.s3.amazonaws.com/?prefix=firecracker-ci/v1.11/$ARCH/vmlinux-5.10&list-type=2" -O - 2>/dev/null | grep -oP "(?<=<Key>)(firecracker-ci/v1.11/$ARCH/vmlinux-5\.10\.[0-9]{1,3})(?=</Key>)") \
+    && wget "https://s3.amazonaws.com/spec.ccfc.min/${latest}" \
+    && wget -O ubuntu-24.04.squashfs.upstream "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.11/${ARCH}/ubuntu-24.04.squashfs"
+
+# Create an ssh key for the rootfs
+RUN unsquashfs ubuntu-24.04.squashfs.upstream \
+    && ssh-keygen -f id_rsa -N "" \
+    && cp -v id_rsa.pub squashfs-root/root/.ssh/authorized_keys \
+    && mv -v id_rsa ./ubuntu-24.04.id_rsa \
+    && chown -R root:root squashfs-root \
+    && truncate -s 500M ubuntu-24.04.ext4 \
+    && mkfs.ext4 -d squashfs-root -F ubuntu-24.04.ext4
+
+# install firecracker
+RUN ARCH="$(uname -m)" \
+    && release_url="https://github.com/firecracker-microvm/firecracker/releases" \
+    && latest=$(basename $(curl -fsSLI -o /dev/null -w  %{url_effective} ${release_url}/latest)) \
+    && curl -L ${release_url}/download/${latest}/firecracker-${latest}-${ARCH}.tgz | tar -xz \
+    && mv release-${latest}-$(uname -m)/firecracker-${latest}-${ARCH} /usr/local/bin/firecracker \
+    && chmod +x /usr/local/bin/firecracker
+
+RUN mkdir -p /var/lib/firecracker/assets
+
+RUN touch /opt/firecracker.log
+
+COPY ./firecracker-config.json /opt/firecracker-config.json
+
+WORKDIR /app
+
+
+# Copy dependency file
+COPY pyproject.toml .
+
+# Install Python dependencies using `uv`
+RUN uv pip compile pyproject.toml -o requirements.lock \
+    && uv pip install -r requirements.lock --system
+
+
+# Set environment variables for paths
+ENV FIRECRACKER_PATH="/usr/local/bin/firecracker"
+ENV KERNEL_PATH="/opt/vmlinux-5.10.225"
+ENV ROOTFS_TEMPLATE="/opt/ubuntu-24.04.ext4"
+
+# Copy application files
+COPY . .
+
+# Set environment variables for Celery
+ENV CELERY_BROKER_URL=redis://redis:6379/0
+ENV CELERY_RESULT_BACKEND=redis://redis:6379/0
+
+# Command to run the Celery worker
+CMD ["celery", "-A", "tasks", "worker", "--loglevel=info"]
